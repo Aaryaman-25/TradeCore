@@ -190,7 +190,7 @@ static int try_handle(ApiState *st, Conn *c) {
     }
     if (!strcmp(method, "GET") && !strcmp(target, "/api/stream")) {
         buf_printf(&c->out, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                   "Cache-Control: no-cache\r\nConnection: keep-alive\r\n%s\r\n", CORS);
+                   "Cache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n%s\r\n", CORS);
         api_stream_hello(st, &c->out);
         c->is_stream = 1;
         return 1;
@@ -234,6 +234,12 @@ int main(int argc, char **argv) {
     int port = 8080;
     int with_sim = 1;
     const char *host = "127.0.0.1";
+    /* Cloud hosts (Render, Railway, Fly, Vercel containers) say which port
+     * to use through the PORT environment variable. */
+    const char *env_port = getenv("PORT");
+    if (env_port && atoi(env_port) > 0) port = atoi(env_port);
+    const char *env_host = getenv("HOST");
+    if (env_host && *env_host) host = env_host;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];

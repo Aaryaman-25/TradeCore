@@ -1,7 +1,8 @@
 // HTTP + Server-Sent Events client for the C engine (see docs/API.md).
 import { settings, bus, shared, session } from './store.js';
 
-const base = () => (settings.get('apiBase') || '').replace(/\/$/, '');
+// Engine address: Settings override, else frontend/config.js, else this same site.
+const base = () => (settings.get('apiBase') || window.TRADECORE_API_URL || '').replace(/\/$/, '');
 
 // Round-trip times (ms) of recent API calls, measured in the browser.
 export const roundTrips = [];

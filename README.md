@@ -32,7 +32,11 @@ Other targets:
 - `make asan` runs the tests under AddressSanitizer and UndefinedBehaviorSanitizer.
 - `make bench` runs the reproducible benchmark (no bots involved).
 - `./build/tradecore --no-sim` starts with an empty book and no bots.
+- The `PORT` and `HOST` environment variables override the defaults (used by cloud hosts).
 - Server flags: `./build/tradecore --port 8080 --host 127.0.0.1 --static ../frontend/dist`
+
+To put it online (Render for the engine, Vercel for the website), follow
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 The full endpoint list is in [docs/API.md](docs/API.md). How the dashboard
 is organised is in [frontend/README.md](frontend/README.md).

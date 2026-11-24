@@ -1,0 +1,9 @@
+# Render Blueprint: lets Render create the engine service from this repo.
+services:
+  - type: web
+    name: tradecore-engine
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
