@@ -1,7 +1,6 @@
 // Settings (saved in the browser) and a tiny event bus shared by all pages.
 
 const DEFAULTS = {
-  trader: 'ME',            // label attached to orders placed from this browser
   apiBase: '',             // '' = same server that serves this page
   theme: 'dark',
   compact: false,
@@ -37,8 +36,27 @@ export const bus = {
   },
 };
 
+// ------------------------------------------------------------ session
+const AUTH_KEY = 'tradecore.auth.v1';
+let authState = { token: null, user: null };
+try { authState = { ...authState, ...JSON.parse(localStorage.getItem(AUTH_KEY) || '{}') }; } catch { /* ignore */ }
+
+export const session = {
+  get token() { return authState.token; },
+  get user() { return authState.user; },
+  set(token, user) {
+    authState = { token, user };
+    try { localStorage.setItem(AUTH_KEY, JSON.stringify(authState)); } catch { /* ignore */ }
+  },
+  clear() {
+    authState = { token: null, user: null };
+    try { localStorage.removeItem(AUTH_KEY); } catch { /* ignore */ }
+  },
+};
+
 export const settings = {
-  get(k) { return values[k]; },
+  // 'trader' is now simply the signed-in account name
+  get(k) { return k === 'trader' ? (authState.user?.username || 'guest') : values[k]; },
   all() { return { ...values }; },
   defaults() { return { ...DEFAULTS }; },
   set(patch) {

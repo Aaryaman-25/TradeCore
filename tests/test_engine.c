@@ -11,6 +11,9 @@
 #include "../src/reference.h"
 #include "../src/scenario.h"
 #include "../src/json.h"
+#include "../src/sha256.h"
+#include "../src/auth.h"
+#include "../src/sim.h"
 
 static int g_pass = 0, g_fail = 0;
 
@@ -363,7 +366,84 @@ static void test_json(void) {
     CHECK(n == 1 && !json_get_i64(kv, n, "qty", &q));
 }
 
+static void test_sha256(void) {
+    printf("SHA-256 test vectors\n");
+    uint8_t h[32];
+    char hex[65];
+    sha256("abc", 3, h);
+    for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", h[i]);
+    CHECK(!strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    sha256("", 0, h);
+    for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", h[i]);
+    CHECK(!strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    const char *long_msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    sha256(long_msg, strlen(long_msg), h);
+    for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", h[i]);
+    CHECK(!strcmp(hex, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+}
+
+static void test_auth(void) {
+    printf("accounts and sessions\n");
+    Auth a; auth_init(&a);
+    char tok[AUTH_TOKEN_LEN + 1], tok2[AUTH_TOKEN_LEN + 1];
+    CHECK(auth_register(&a, "Riya_2", "secret1", 0, 1000) == AUTH_OK);
+    CHECK(auth_register(&a, "riya_2", "other99", 0, 1000) == AUTH_TAKEN);   /* case-insensitive */
+    CHECK(auth_register(&a, "ab", "secret1", 0, 1000) == AUTH_BAD_USERNAME);
+    CHECK(auth_register(&a, "bad name", "secret1", 0, 1000) == AUTH_BAD_USERNAME);
+    CHECK(auth_register(&a, "okname", "12345", 0, 1000) == AUTH_BAD_PASSWORD_RULES);
+    CHECK(auth_login(&a, "riya_2", "wrong!!", 2000, tok) == AUTH_WRONG_CREDENTIALS);
+    CHECK(auth_login(&a, "nobody", "secret1", 2000, tok) == AUTH_WRONG_CREDENTIALS);
+    CHECK(auth_login(&a, "RIYA_2", "secret1", 2000, tok) == AUTH_OK);
+    CHECK(strlen(tok) == AUTH_TOKEN_LEN);
+    const User *u = auth_check(&a, tok, 3000);
+    CHECK(u && !strcmp(u->name, "Riya_2"));
+    CHECK(auth_login(&a, "riya_2", "secret1", 2000, tok2) == AUTH_OK && strcmp(tok, tok2) != 0);
+    CHECK(auth_check(&a, "deadbeef", 3000) == NULL);
+    CHECK(auth_check(&a, tok, 2000 + AUTH_SESSION_MS + 1) == NULL);           /* expired */
+    CHECK(auth_check(&a, tok, 3000) == NULL);                                 /* and removed */
+    auth_logout(&a, tok2);
+    CHECK(auth_check(&a, tok2, 3000) == NULL);
+    /* string map growth */
+    char name[16];
+    for (int i = 0; i < 300; i++) { sprintf(name, "user%03d", i); auth_register(&a, name, "pass123", 0, 0); }
+    CHECK(a.users.size == 301 && a.users.size * 4 <= a.users.cap * 3);
+    auth_free(&a);
+}
+
+static void test_simulator(void) {
+    printf("live market simulator (20,000 bot steps, invariants after every step)\n");
+    Engine e; engine_init(&e, 1 << 12);
+    Sim s; sim_init(&s, 7);
+    tc_result buf[SIM_MAX_BATCH];
+    const char *err = NULL;
+    sim_mode modes[] = { SIM_CALM, SIM_VOLATILE, SIM_BULL, SIM_BEAR, SIM_CRASH };
+    for (int i = 0; i < 20000 && !err; i++) {
+        if (i % 4000 == 0) sim_set_mode(&s, modes[i / 4000], i * 250);
+        int n = sim_step(&s, &e, (int64_t)i * 250, buf);
+        CHECK(n >= 1 && n <= SIM_MAX_BATCH);
+        if (n < 1) break;
+        err = engine_check(&e);
+    }
+    if (err) { g_fail++; printf("  INVARIANT %s\n", err); } else g_pass++;
+    CHECK(e.trades.len > 2000);
+    CHECK(e.active_orders < 2000);            /* housekeeping keeps the book bounded */
+    uint64_t fills = 0;
+    for (int i = 0; i < s.nbots; i++) fills += s.bots[i].fills;
+    CHECK(fills == 2 * e.trades.len);        /* every trade has a bot on both sides */
+    size_t self = 0;
+    for (size_t i = 0; i < e.trades.len; i++) {
+        const Trade *t = engine_trade(&e, i);
+        if (!strcmp(engine_record(&e, t->maker_id)->trader, engine_record(&e, t->taker_id)->trader)) self++;
+    }
+    CHECK(self == 0);                        /* self-trade prevention works */
+    CHECK(sim_is_bot_name(&s, "riya") && !sim_is_bot_name(&s, "demo"));
+    engine_free(&e);
+}
+
 int main(void) {
+    test_sha256();
+    test_auth();
+    test_simulator();
     test_json();
     test_worked_example();
     test_fifo_priority_and_partial();

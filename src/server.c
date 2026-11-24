@@ -70,7 +70,7 @@ static const char *status_text(int code) {
 static const char *CORS =
     "Access-Control-Allow-Origin: *\r\n"
     "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-    "Access-Control-Allow-Headers: Content-Type\r\n";
+    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
 
 static void respond(Conn *c, int code, const char *ctype, const char *body, size_t len) {
     buf_printf(&c->out, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
@@ -150,12 +150,23 @@ static int try_handle(ApiState *st, Conn *c) {
     }
     size_t hdr_len = (size_t)(hdr_end - c->in.s) + 4;
 
-    /* Content-Length (case-insensitive header search) */
+    /* Content-Length and Authorization (case-insensitive header search) */
     size_t clen = 0;
+    char token[96] = "";
     for (char *p = c->in.s; p < hdr_end; ) {
         char *eol = strstr(p, "\r\n");
         if (!eol) break;
         if (!strncasecmp(p, "Content-Length:", 15)) clen = (size_t)strtoul(p + 15, NULL, 10);
+        if (!strncasecmp(p, "Authorization:", 14)) {
+            const char *v = p + 14;
+            while (*v == ' ') v++;
+            if (!strncasecmp(v, "Bearer ", 7)) {
+                v += 7;
+                size_t n = 0;
+                while (v + n < eol && n < sizeof token - 1) { token[n] = v[n]; n++; }
+                token[n] = '\0';
+            }
+        }
         p = eol + 2;
     }
     if (clen > MAX_REQUEST) { respond(c, 413, "application/json", "{\"ok\":false}", 12); return 1; }
@@ -191,7 +202,7 @@ static int try_handle(ApiState *st, Conn *c) {
     r.status = 500;
     buf_init(&r.body);
     buf_init(&r.broadcast);
-    api_handle(st, method, target, query, body, clen, &r);
+    api_handle(st, method, target, query, body, clen, token[0] ? token : NULL, &r);
     respond(c, r.status, "application/json", r.body.s ? r.body.s : "{}", r.body.len);
     broadcast(&r.broadcast);
     buf_free(&r.body);
@@ -221,13 +232,15 @@ static int open_listener(const char *host, int port) {
 
 int main(int argc, char **argv) {
     int port = 8080;
+    int with_sim = 1;
     const char *host = "127.0.0.1";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--static") && i + 1 < argc) g_static_dir = argv[++i];
+        else if (!strcmp(argv[i], "--no-sim")) with_sim = 0;
         else {
-            fprintf(stderr, "usage: %s [--port N] [--host ADDR] [--static DIR]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--port N] [--host ADDR] [--static DIR] [--no-sim]\n", argv[0]);
             return 1;
         }
     }
@@ -237,11 +250,13 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
 
     ApiState st;
-    if (api_init(&st) != 0) { fprintf(stderr, "engine init failed\n"); return 1; }
+    if (with_sim) printf("Generating 3 hours of demo market history...\n");
+    if (api_init(&st, with_sim) != 0) { fprintf(stderr, "engine init failed\n"); return 1; }
     int lfd = open_listener(host, port);
     if (lfd < 0) return 1;
     printf("TradeCore engine listening on http://%s:%d  (Ctrl+C to stop)\n", host, port);
-    printf("  try: curl http://%s:%d/api/health\n", host, port);
+    printf("  dashboard: http://%s:%d   (demo login: demo / demo1234)\n", host, port);
+    printf("  live bots: %s\n", with_sim ? "trading (pause them on the Demo Lab page)" : "off (--no-sim)");
     fflush(stdout);
 
     struct pollfd pfds[MAX_CONNS + 1];
@@ -256,7 +271,13 @@ int main(int argc, char **argv) {
             if (g_conns[i].out.len > g_conns[i].out_off) pfds[i + 1].events |= POLLOUT;
         }
         int nfds = g_nconns + 1;
-        int rc = poll(pfds, (nfds_t)nfds, 1000);
+        /* wake up in time for the next bot order */
+        Buf simb; buf_init(&simb);
+        int64_t wait = api_sim_tick(&st, tc_now_ms(), &simb);
+        broadcast(&simb); buf_free(&simb);
+        for (int i = 0; i < g_nconns; i++)       /* broadcast may have queued output */
+            if (g_conns[i].out.len > g_conns[i].out_off) pfds[i + 1].events |= POLLOUT;
+        int rc = poll(pfds, (nfds_t)nfds, (int)(wait > 1000 ? 1000 : wait));
         if (rc < 0) { if (errno == EINTR) continue; perror("poll"); break; }
 
         /* heartbeat keeps proxies/browsers from timing out idle streams */

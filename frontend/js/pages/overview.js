@@ -1,14 +1,17 @@
 // Overview: market snapshot, price movement, pressure, depth, recent trades.
-import { get } from '../api.js';
-import { $, inr, px, int, pct, inrCompact, clock, onResize, sideTag } from '../ui.js';
+import { get, isMine } from '../api.js';
+import { bus, shared, session } from '../store.js';
+import { $, esc, inr, px, int, pct, inrCompact, clock, onResize, sideTag } from '../ui.js';
 import { icon } from '../icons.js';
 import { areaChart } from '../charts.js';
-import { priceSeries, wireSeg } from './common.js';
+import { priceSeries, wireSeg, describeCommand, feedItem } from './common.js';
 
-let range = '1H', filter = 'all', stopResize, lastSeries = null;
+let range = '1H', filter = 'all', stopResize, lastSeries = null, offFeed;
+const WELCOME_KEY = () => `tradecore.welcome.${session.user?.username}`;
 
 export default {
   html: () => `
+  ${welcome()}
   <div class="grid g6">
     <div class="card stat">
       <div class="label">Simulated price</div>
@@ -84,24 +87,40 @@ export default {
     </div>
   </div>
 
-  <div class="card mt">
+  <div class="grid mt" style="grid-template-columns:minmax(0,1.75fr) minmax(0,1fr)">
+  <div class="card">
     <div class="card-head" style="margin-bottom:24px">
       <div><h3>Recent Executed Trades</h3><div class="sub">Live ticker stream from the matching engine</div></div>
       <div class="seg sm" id="ov-filter"><button class="on" data-v="all">${icon('list-filter', 14)} All</button><button data-v="buy">Buy</button><button data-v="sell">Sell</button></div>
     </div>
     <table class="table boxed">
-      <thead><tr><th>Execution price</th><th>Quantity</th><th>Time (IST)</th><th>Type</th><th class="r">Total value</th></tr></thead>
+      <thead><tr><th>Execution price</th><th>Quantity</th><th>Time (IST)</th><th>Type</th><th>Buyer → Seller</th><th class="r">Total value</th></tr></thead>
       <tbody id="ov-trades"></tbody>
     </table>
+  </div>
+  <div class="card">
+    <div class="card-head"><div><h3>Who's Trading</h3><div class="sub">Every order, in plain words</div></div><span class="live"><span class="dot pulse"></span>live</span></div>
+    <div class="feed" id="ov-feed"></div>
+  </div>
   </div>`,
 
   mount(root) {
     wireSeg(root, '#ov-range', v => { range = v; $('#ov-rlabel').textContent = v; drawChart(); });
     wireSeg(root, '#ov-filter', v => { filter = v; drawTrades(); });
     stopResize = onResize($('#ov-chart'), () => lastSeries && paint());
+    $('#ov-welcome-x')?.addEventListener('click', () => { try { localStorage.setItem(WELCOME_KEY(), '1'); } catch { /* ignore */ } $('#ov-welcome').remove(); });
+    const items = shared.commandLog.map(c => [describeCommand(c, isMine), c.order?.time_ms]).filter(x => x[0]).slice(0, 9);
+    $('#ov-feed').innerHTML = items.map(([d, t]) => feedItem(d, t || Date.now())).join('') || '<div class="empty">Waiting for the next order…</div>';
+    offFeed = bus.on('command', cmd => {
+      const d = describeCommand(cmd, isMine), el = $('#ov-feed');
+      if (!d || !el) return;
+      el.querySelector('.empty')?.remove();
+      el.insertAdjacentHTML('afterbegin', feedItem(d, Date.now(), true));
+      while (el.children.length > 9) el.lastElementChild.remove();
+    });
   },
 
-  unmount() { stopResize?.(); },
+  unmount() { stopResize?.(); offFeed?.(); },
 
   async refresh() {
     const [s] = await Promise.all([get('/api/summary'), drawChart(), drawTrades()]);
@@ -171,6 +190,30 @@ async function drawTrades() {
   el.innerHTML = rows.length ? rows.map(t => `<tr>
       <td class="sell num" style="font-weight:600">${inr(t.price)}</td><td class="num">${t.qty}</td>
       <td class="num">${clock(t.time_ms)}</td><td>${sideTag(t.taker_side)}</td>
+      <td style="font-size:14px">${who(t, 'buy')} → ${who(t, 'sell')}</td>
       <td class="r num">${inr(t.price * t.qty)}</td></tr>`).join('')
-    : `<tr><td colspan="5" class="empty">No trades yet. Place an order or load a scenario.</td></tr>`;
+    : `<tr><td colspan="6" class="empty">No trades yet. Place an order or load a scenario.</td></tr>`;
+}
+
+function who(t, side) {
+  const takerSide = t.taker_side === side;
+  const name = takerSide ? t.taker_trader : t.maker_trader, owner = takerSide ? t.taker_owner : t.maker_owner;
+  return isMine(owner) ? '<b class="accent">You</b>' : esc(name || '—');
+}
+
+function welcome() {
+  let seen = false;
+  try { seen = !!localStorage.getItem(WELCOME_KEY()); } catch { /* ignore */ }
+  if (seen) return '';
+  const u = esc(session.user?.username || '');
+  return `<div class="card welcome" id="ov-welcome" style="margin-bottom:var(--gap)">
+    <div><h2>Welcome, ${u} 👋</h2>
+      <div class="muted">The market is already running — 12 bot traders are buying and selling TCX right now. Here's how to get started:</div>
+      <div class="quick">
+        <a href="#/trade/terminal">${icon('chart-candlestick', 22)}<span><b>1 · Place your first order</b><small>Buy or sell TCX in the Trading Terminal. Bots will trade with you.</small></span></a>
+        <a href="#/dsa/dsa">${icon('workflow', 22)}<span><b>2 · Look inside the engine</b><small>Watch your order travel through the AVL tree, FIFO queue and hash table.</small></span></a>
+        <a href="#/lab/market">${icon('flask-conical', 22)}<span><b>3 · Shake the market</b><small>Trigger a flash crash or a bull run in the Demo Lab.</small></span></a>
+      </div></div>
+    <button class="iconbtn" id="ov-welcome-x" title="Dismiss" style="align-self:start">${icon('x', 18)}</button>
+  </div>`;
 }

@@ -242,8 +242,8 @@ static void remove_active(Engine *e, Order *o, tc_status final_status) {
  * then rest whatever is left. Returns the new order id.
  */
 static tc_id match_and_rest(Engine *e, tc_side side, tc_price price,
-                            tc_qty qty, const char *trader, int64_t now_ms,
-                            tc_id replaces) {
+                            tc_qty qty, const char *trader, const char *owner,
+                            int64_t now_ms, tc_id replaces) {
     tc_id id = e->next_order_id++;
     size_t rec_idx = e->records.len;
     OrderRecord *rec = vec_push(&e->records);
@@ -260,6 +260,10 @@ static tc_id match_and_rest(Engine *e, tc_side side, tc_price price,
     if (trader) {
         strncpy(rec->trader, trader, TC_TRADER_LEN - 1);
         rec->trader[TC_TRADER_LEN - 1] = '\0';
+    }
+    if (owner) {
+        strncpy(rec->owner, owner, TC_TRADER_LEN - 1);
+        rec->owner[TC_TRADER_LEN - 1] = '\0';
     }
     e->ctr.submits++;
     tracer_emit(&e->tracer, EV_ORDER_ACCEPTED, side, price, id, 0, qty,
@@ -346,6 +350,11 @@ static tc_id match_and_rest(Engine *e, tc_side side, tc_price price,
 
 tc_result engine_submit(Engine *e, tc_side side, tc_price price, tc_qty qty,
                         const char *trader, int64_t now_ms) {
+    return engine_submit_as(e, side, price, qty, trader, trader, now_ms);
+}
+
+tc_result engine_submit_as(Engine *e, tc_side side, tc_price price, tc_qty qty,
+                           const char *trader, const char *owner, int64_t now_ms) {
     tc_result r;
     begin_cmd(e, &r, CMD_SUBMIT, &now_ms);
     tc_reject why = (side != TC_BUY && side != TC_SELL) ? RJ_BAD_SIDE
@@ -354,7 +363,7 @@ tc_result engine_submit(Engine *e, tc_side side, tc_price price, tc_qty qty,
         reject(e, &r, why, 0);
     } else {
         r.ok = 1;
-        r.order_id = match_and_rest(e, side, price, qty, trader, now_ms, 0);
+        r.order_id = match_and_rest(e, side, price, qty, trader, owner, now_ms, 0);
     }
     end_cmd(e, &r);
     return r;
@@ -403,13 +412,14 @@ tc_result engine_replace(Engine *e, tc_id id, tc_price new_price,
     }
     tc_side side = o->side;
     size_t old_idx = o->record;
-    char trader[TC_TRADER_LEN];
+    char trader[TC_TRADER_LEN], owner[TC_TRADER_LEN];
     memcpy(trader, rec_mut(e, old_idx)->trader, TC_TRADER_LEN);
+    memcpy(owner, rec_mut(e, old_idx)->owner, TC_TRADER_LEN);
 
     remove_active(e, o, ST_REPLACED);
     tracer_emit(&e->tracer, EV_ORDER_REPLACED, side, new_price, id,
                 e->next_order_id, new_qty, 0, 0);
-    tc_id nid = match_and_rest(e, side, new_price, new_qty, trader, now_ms, id);
+    tc_id nid = match_and_rest(e, side, new_price, new_qty, trader, owner, now_ms, id);
     rec_mut(e, old_idx)->replaced_by = nid;  /* re-fetch: vec may have moved */
     e->ctr.replaces++;
     r.ok = 1;

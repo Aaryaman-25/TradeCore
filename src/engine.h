@@ -44,7 +44,8 @@ typedef struct {
     int64_t  time_ms;
     tc_id    replaces;     /* id of the order this one replaced, or 0 */
     tc_id    replaced_by;  /* id of the replacement, or 0             */
-    char     trader[TC_TRADER_LEN];
+    char     trader[TC_TRADER_LEN];  /* display label (account name, bot or scenario role) */
+    char     owner[TC_TRADER_LEN];   /* account allowed to cancel / replace it          */
 } OrderRecord;
 
 typedef struct {
@@ -105,6 +106,10 @@ tc_reject tc_validate(tc_price price, tc_qty qty);
 
 tc_result engine_submit(Engine *e, tc_side side, tc_price price, tc_qty qty,
                         const char *trader, int64_t now_ms);
+/* Same as engine_submit, but the order's label and owning account differ
+ * (e.g. a scenario order labelled "S1" placed by user "demo"). */
+tc_result engine_submit_as(Engine *e, tc_side side, tc_price price, tc_qty qty,
+                           const char *trader, const char *owner, int64_t now_ms);
 tc_result engine_cancel(Engine *e, tc_id id, int64_t now_ms);
 tc_result engine_replace(Engine *e, tc_id id, tc_price new_price,
                          tc_qty new_qty, int64_t now_ms);

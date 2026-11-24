@@ -1,5 +1,5 @@
 // Trade History: every fill, linked to maker, taker and command sequence.
-import { get } from '../api.js';
+import { get, isMine } from '../api.js';
 import { settings } from '../store.js';
 import { $, esc, px, int, inr, inrCompact, clock, toast, sideTag } from '../ui.js';
 import { icon } from '../icons.js';
@@ -62,7 +62,7 @@ function stat(label, id, ic, cls) {
 function filtered() {
   const me = settings.get('trader');
   return trades.filter(t => (side === 'all' || t.taker_side === side) &&
-    (!mine || t.maker_trader === me || t.taker_trader === me) &&
+    (!mine || isMine(t.maker_owner) || isMine(t.taker_owner)) &&
     (!q || [t.trade_id, t.buy_order_id, t.sell_order_id].some(x => String(x) === q.replace(/^#?(ord-)?/, '')) ||
       t.maker_trader.toLowerCase().includes(q) || t.taker_trader.toLowerCase().includes(q)));
 }
@@ -77,7 +77,7 @@ function draw() {
     <td class="r sell num" style="font-weight:600">${px(t.price)}</td><td class="r num">${int(t.qty)}</td><td class="r num">${px(t.price * t.qty)}</td>
     <td style="padding-left:24px">${sideTag(t.taker_side)}</td>
     <td class="mono">ORD-${t.buy_order_id}</td><td class="mono">ORD-${t.sell_order_id}</td>
-    <td style="font-size:14px">${esc(t.maker_trader || '—')} → ${esc(t.taker_trader || '—')}</td>
+    <td style="font-size:14px">${isMine(t.maker_owner) ? '<b class="accent">You</b>' : esc(t.maker_trader || '—')} → ${isMine(t.taker_owner) ? '<b class="accent">You</b>' : esc(t.taker_trader || '—')}</td>
     <td class="r num dim">${t.cmd_seq}</td></tr>`).join('')
     : '<tr><td colspan="10" class="empty">No trades match these filters.</td></tr>';
   const from = rows.length ? (page - 1) * PER_PAGE + 1 : 0;

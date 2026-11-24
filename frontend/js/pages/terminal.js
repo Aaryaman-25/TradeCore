@@ -1,5 +1,5 @@
 // Trading Terminal: chart, live book, executions, order entry, my orders.
-import { get, post, roundTrips } from '../api.js';
+import { get, post, roundTrips, isMine } from '../api.js';
 import { settings, shared, bus } from '../store.js';
 import { $, $$, esc, inr, px, int, clock, toast, modal, onResize, aggregate, statusTag } from '../ui.js';
 import { icon } from '../icons.js';
@@ -47,7 +47,8 @@ export default {
 
   <div class="grid g2 mt">
     <div class="card" style="padding:24px">
-      <div class="card-head"><h3>Order Placement</h3><span style="font-size:13px">Trader: <b id="tm-trader"></b></span></div>
+      <div class="card-head"><h3>Order Placement</h3><span style="font-size:13px">Trading as <b class="accent" id="tm-trader"></b></span></div>
+      <div class="portfolio" id="tm-pf" title="Paper portfolio: starts with ₹1,00,000. It is tracked by the dashboard from your fills, not enforced by the engine."></div>
       <div class="side-toggle" id="tm-side">
         <button class="buy-btn on" data-v="buy">BUY</button><button class="sell-btn" data-v="sell">SELL</button>
       </div>
@@ -110,9 +111,10 @@ export default {
   unmount() { stopResize?.(); offCmd?.(); },
 
   async refresh() {
-    const [s, b, t, o] = await Promise.all([
+    const [s, b, t, o, mt] = await Promise.all([
       get('/api/summary'), get('/api/book?depth=60'), get('/api/trades?limit=6'),
-      get(`/api/orders?trader=${encodeURIComponent(settings.get('trader'))}&limit=40`),
+      get(`/api/orders?owner=${encodeURIComponent(settings.get('trader'))}&limit=40`),
+      get(`/api/trades?owner=${encodeURIComponent(settings.get('trader'))}&limit=5000`),
     ]);
     book = b;
     if (s.ok) {
@@ -129,6 +131,7 @@ export default {
     $('#tm-bidhint').textContent = b.best_bid ? px(b.best_bid) : '—';
     $('#tm-askhint').textContent = b.best_ask ? px(b.best_ask) : '—';
     myOrders = o.orders || [];
+    drawPortfolio(mt.trades || [], s.last);
     drawOrders();
     drawBook();
     updateTotal();
@@ -198,10 +201,10 @@ async function submit() {
   const btn = $('#tm-submit');
   btn.disabled = true;
   try {
-    const r = await post('/api/orders', { side, price, qty, trader: settings.get('trader') });
+    const r = await post('/api/orders', { side, price, qty });
     if (!r.ok) return toast(`<b>Rejected:</b> ${esc(r.message)}`, 'err');
     const f = r.fills.reduce((a, x) => a + x.qty, 0);
-    toast(`<b>Order #${r.order.id} ${r.order.status}</b> — ${f} filled, ${r.order.remaining} resting`, 'ok');
+    toast(f ? `<b>Order #${r.order.id}: ${f} TCX filled</b>${r.order.remaining ? `, ${r.order.remaining} resting in the book` : ' — fully executed'}` : `<b>Order #${r.order.id} placed</b> — resting at ₹${px(r.order.price)} until a bot trades with it`, 'ok');
   } catch (e) { toast(esc(e.message), 'err'); }
   finally { btn.disabled = false; }
 }
@@ -243,4 +246,30 @@ async function onOrderAction(e) {
   if (!res) return;
   const r = await post(`/api/orders/${id}/replace`, { price: $('#rp-price', res).value, qty: $('#rp-qty', res).value });
   toast(r.ok ? `Order #${id} replaced by #${r.order.id}` : `<b>Replace rejected:</b> ${esc(r.message)} (original kept)`, r.ok ? 'ok' : 'err');
+}
+
+/* Paper portfolio from your own fills (average-cost method). */
+const START_CASH = 100000;
+function drawPortfolio(trades, last) {
+  let pos = 0, cash = START_CASH, cost = 0;
+  for (const t of trades.slice().reverse()) {            // oldest first
+    const me = isMine(t.taker_owner) ? 'taker' : 'maker';
+    const side = me === 'taker' ? t.taker_side : (t.taker_side === 'buy' ? 'sell' : 'buy');
+    // a self-trade (you on both sides) nets to zero
+    if (isMine(t.taker_owner) && isMine(t.maker_owner)) continue;
+    const q = side === 'buy' ? t.qty : -t.qty;
+    cash -= q * t.price;
+    if (pos === 0 || Math.sign(pos) === Math.sign(q)) cost += q * t.price;          // adding to position
+    else if (Math.abs(q) <= Math.abs(pos)) cost -= (cost / pos) * -q;              // reducing
+    else cost = (pos + q) * t.price;                                               // flipped side
+    pos += q;
+  }
+  const avg = pos ? cost / pos : null;
+  const mark = last ?? avg ?? 0;
+  const equity = cash + pos * mark, pnl = equity - START_CASH;
+  $('#tm-pf').innerHTML = `
+    <div><span class="label">Position</span><b class="num ${pos > 0 ? 'buy' : pos < 0 ? 'sell' : ''}">${pos > 0 ? '+' : ''}${int(pos)} TCX</b></div>
+    <div><span class="label">Avg cost</span><b class="num">${avg != null ? inr(Math.abs(avg)) : '—'}</b></div>
+    <div><span class="label">Cash</span><b class="num">${inr(cash)}</b></div>
+    <div><span class="label">Paper P&amp;L</span><b class="num ${pnl >= 0 ? 'buy' : 'sell'}">${pnl >= 0 ? '+' : '−'}${inr(Math.abs(pnl))}</b></div>`;
 }

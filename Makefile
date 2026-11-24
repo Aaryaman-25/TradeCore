@@ -7,7 +7,8 @@ DEFS    := -D_POSIX_C_SOURCE=200809L -D_DARWIN_C_SOURCE
 LDLIBS  += -lm
 
 CORE := src/trace.c src/order_list.c src/avl.c src/hashmap.c src/vec.c \
-        src/engine.c src/reference.c src/scenario.c
+        src/engine.c src/reference.c src/scenario.c \
+        src/sha256.c src/auth.c src/sim.c
 SERVER := $(CORE) src/json.c src/api.c src/server.c
 
 .PHONY: all test asan bench run clean

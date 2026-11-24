@@ -4,8 +4,8 @@ import { get, post } from '../api.js';
 import { $, $$, esc, int, ns, bytes, toast } from '../ui.js';
 import { icon } from '../icons.js';
 
-const sell = (label, price, qty, desc) => ({ label, kind: 'sell', tag: 'SELL LIMIT', desc, run: () => post('/api/orders', { side: 'sell', price, qty, trader: label }) });
-const buy = (label, price, qty, desc) => ({ label, kind: 'buy', tag: 'BUY LIMIT', desc, run: () => post('/api/orders', { side: 'buy', price, qty, trader: label }) });
+const sell = (label, price, qty, desc) => ({ label, kind: 'sell', tag: 'SELL LIMIT', desc, run: () => post('/api/orders', { side: 'sell', price, qty, label }) });
+const buy = (label, price, qty, desc) => ({ label, kind: 'buy', tag: 'BUY LIMIT', desc, run: () => post('/api/orders', { side: 'buy', price, qty, label }) });
 
 const SCENARIOS = [
   {
@@ -42,8 +42,8 @@ const SCENARIOS = [
     ],
     success: 'HEIGHT 4 FOR 15 NODES',
     steps: () => Array.from({ length: 15 }, (_, i) => i).flatMap(i => [
-      { label: `D${2 * i + 1}`, kind: 'buy', tag: 'BUY LIMIT', desc: `Bid level ₹${(99.95 - i * 0.05).toFixed(2)} (10 TCX)`, run: () => post('/api/orders', { side: 'buy', price: (99.95 - i * 0.05).toFixed(2), qty: 10 + i, trader: 'deep' }) },
-      { label: `D${2 * i + 2}`, kind: 'sell', tag: 'SELL LIMIT', desc: `Ask level ₹${(100.05 + i * 0.05).toFixed(2)} (10 TCX)`, run: () => post('/api/orders', { side: 'sell', price: (100.05 + i * 0.05).toFixed(2), qty: 10 + i, trader: 'deep' }) },
+      { label: `D${2 * i + 1}`, kind: 'buy', tag: 'BUY LIMIT', desc: `Bid level ₹${(99.95 - i * 0.05).toFixed(2)} (10 TCX)`, run: () => post('/api/orders', { side: 'buy', price: (99.95 - i * 0.05).toFixed(2), qty: 10 + i, label: 'Deep' }) },
+      { label: `D${2 * i + 2}`, kind: 'sell', tag: 'SELL LIMIT', desc: `Ask level ₹${(100.05 + i * 0.05).toFixed(2)} (10 TCX)`, run: () => post('/api/orders', { side: 'sell', price: (100.05 + i * 0.05).toFixed(2), qty: 10 + i, label: 'Deep' }) },
     ]),
   },
   {
@@ -60,7 +60,7 @@ const SCENARIOS = [
     success: 'Q4 FILLS FIRST',
     steps: () => {
       const ids = {};
-      const q = n => ({ label: `Q${n}`, kind: 'buy', tag: 'BUY LIMIT', desc: `Join the ₹99.50 queue with ${n * 10} TCX`, run: async () => { const r = await post('/api/orders', { side: 'buy', price: 99.5, qty: n * 10, trader: `Q${n}` }); ids[n] = r.order?.id; return r; } });
+      const q = n => ({ label: `Q${n}`, kind: 'buy', tag: 'BUY LIMIT', desc: `Join the ₹99.50 queue with ${n * 10} TCX`, run: async () => { const r = await post('/api/orders', { side: 'buy', price: 99.5, qty: n * 10, label: `Q${n}` }); ids[n] = r.order?.id; return r; } });
       const c = (n, where) => ({ label: `X${n}`, kind: 'sell', tag: 'CANCEL', desc: `Cancel Q${n} (${where} of the queue)`, run: () => post(`/api/orders/${ids[n]}/cancel`) });
       return [q(1), q(2), q(3), q(4), q(5), c(3, 'middle'), c(1, 'head'), c(5, 'tail'),
         { label: 'R2', kind: 'sell', tag: 'REPLACE', desc: 'Replace Q2 with 25 TCX — new id, back of the queue', run: () => post(`/api/orders/${ids[2]}/replace`, { qty: 25 }) },
@@ -118,7 +118,10 @@ export default {
         <button class="btn ghost lg" id="sc-pause">${icon('pause', 17)} Pause Replay</button>
         <button class="btn danger lg" id="sc-reset">${icon('rotate-ccw', 17)} Reset Simulation</button>
       </div>
-      <div class="dim" style="font-size:12.5px;margin-top:12px">Tip: open the DSA Visualizer in a second browser tab to watch each command change the trees, queues and hash table.</div>
+      <div class="dim" style="font-size:12.5px;margin-top:12px">Loading a scenario <b>pauses the live bots</b> and clears the book, so you only see the scenario's orders.
+        Tip: open the DSA Visualizer in a second browser tab to watch each command change the trees, queues and hash table.</div>
+      <div class="hint" style="margin:14px 0 0;display:none" id="sc-resume"><span>The live bots are paused.</span>
+        <button class="btn sm primary" id="sc-resume-btn">${icon('play', 14)} Resume live market</button></div>
     </div>
   </div>
 
@@ -146,6 +149,7 @@ export default {
     $('#sc-start').onclick = start;
     $('#sc-pause').onclick = pause;
     $('#sc-reset').onclick = resetSim;
+    $('#sc-resume-btn').onclick = async () => { await post('/api/sim', { running: true }); toast('Live market resumed', 'ok'); this.refresh(); };
     $('#sc-speed').value = String(speed);
     $('#sc-speed').onchange = e => { speed = +e.target.value; };
     clockTimer = setInterval(drawTime, 250);
@@ -155,7 +159,9 @@ export default {
   unmount() { clearInterval(clockTimer); /* a running replay keeps going in the background */ },
 
   async refresh() {
-    const [s, st, chk] = await Promise.all([get('/api/summary'), get('/api/stats'), get('/api/check')]);
+    const [s, st, chk, sim] = await Promise.all([get('/api/summary'), get('/api/stats'), get('/api/check'), get('/api/sim')]);
+    const rb = $('#sc-resume');
+    if (rb) rb.style.display = sim.ok && !sim.sim.running ? 'flex' : 'none';
     $('#sc-active').textContent = int(s.active_orders);
     $('#sc-fills').textContent = int(s.total_trades);
     if (st.ok) {
@@ -224,11 +230,12 @@ function drawControls() {
 }
 
 async function load() {
+  await post('/api/sim', { running: false });      // quiet market: only the scenario's orders
   const ok = await post('/api/reset');
   if (!ok.ok) return toast('Could not reset the engine', 'err');
   loaded = sel; steps = sel.steps(); pos = 0; elapsed = 0;
   drawList(); drawInfo(); drawControls(); drawTime();
-  toast(`Loaded <b>${sel.name}</b> — engine session reset. Press Start Replay.`, 'ok');
+  toast(`Loaded <b>${sel.name}</b> — bots paused and the book cleared. Press Start Replay.`, 'ok');
 }
 
 function start() {

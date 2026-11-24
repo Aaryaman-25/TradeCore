@@ -17,25 +17,37 @@ The engine sends CORS headers.
 
 ```
 frontend/
-├── index.html          shell: sidebar + top bar + <main id="view">
+├── index.html          empty <div id="root">: app.js renders the sign-in page or the app
 ├── css/style.css       design tokens (colours, spacing), dark + light theme, all components
 ├── fonts/              Newsreader (SIL Open Font License), bundled so it works offline
 ├── img/                logo, Lucide icon licence
 └── js/
-    ├── app.js          router (#/page), top bar, notifications, live refresh
+    ├── app.js          sign-in gate, 4 sidebar sections with tabs, router (#/section/tab),
+    │                   account menu, help tips, notifications, live refresh
+    ├── login.js        sign-in / create-account page with a live market preview
     ├── api.js          fetch wrapper + Server-Sent Events stream (/api/stream)
     ├── store.js        settings saved in localStorage + a tiny event bus
     ├── ui.js           formatting (₹, times, ns), toasts, modal, aggregation
     ├── charts.js       hand-written SVG charts: area, candles, bars, depth
     ├── icons.js        Lucide icons (ISC licence) as inline SVG
     └── pages/          one file per sidebar entry
-        overview.js  terminal.js  orderbook.js  charts.js  dsa.js
-        orders.js    history.js   performance.js  scenarios.js  settings.js
+        overview.js  orderbook.js  charts.js          (Dashboard)
+        terminal.js  orders.js    history.js         (Trading Terminal)
+        dsa.js       performance.js                  (DSA Visualizer)
+        market.js    scenarios.js                    (Demo Lab)
+        settings.js                                  (account menu → Settings)
 ```
+
+The session token from sign-in is kept in `localStorage` and sent as
+`Authorization: Bearer …` on every request. A `401` sends you back to the
+sign-in page.
 
 Each page module exports `html()` (static markup), `mount()` (wire events),
 `refresh()` (fetch data and update the DOM) and `unmount()`. `app.js` calls
-`refresh()` whenever the engine streams a command, debounced to 120 ms.
+`refresh()` whenever the engine streams a command, at most every 700 ms, so
+pages stay smooth while the bots trade several times a second. The DSA
+Visualizer animates only your own orders by default (switch to “All activity”
+to include the bots).
 
 ## Where the screens differ from the mockups
 
@@ -50,11 +62,12 @@ closest **real** measurement in the same place:
 | 24H High/Low/Volume | Session high/low/volume | A simulated session, not 24 hours of trading |
 | Funding rate | Last fill / VWAP / spread | There are no perpetual futures in scope |
 | Market and Stop-Limit buttons | Shown but disabled | The proposal limits scope to limit orders |
-| Available balance ₹54,250 | Trader label | There is no cash ledger (out of scope) |
+| Available balance ₹54,250 | Paper portfolio (position, avg cost, cash, P&L) from your fills | The engine has no cash ledger; the dashboard tracks a virtual ₹1,00,000 |
 | Thread pool, 16 cores | Operation mix of the single engine thread | The engine is deliberately single-threaded |
 | GC pauses, 1.24 GB heap | Live heap blocks (allocs − frees), book/history memory | C has no garbage collector; these are the real counters |
 | "Zero memory leaks over 168h" | Live result of `/api/check` (all invariants) | A claim the dashboard can actually verify |
 | Default leverage 1x/5x/10x/20x | Default order quantity | There is no margin trading |
+| Ten sidebar entries | Four sections with tabs | Simpler navigation; nothing was removed |
 | WebSocket settings | Server-Sent Events settings | The engine streams over SSE |
 | Flash Crunch / HF Arbitrage presets | AVL stress, cancel/replace drill, random flow | Scenarios that demonstrate the course's data structures |
 

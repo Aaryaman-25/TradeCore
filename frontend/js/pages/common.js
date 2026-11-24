@@ -46,3 +46,33 @@ export function wireSeg(root, sel, onPick) {
     onPick(b.dataset.v);
   }));
 }
+
+/**
+ * Turn a streamed command into a plain-English activity line.
+ * Returns { who, text, side, mine } or null for uninteresting commands.
+ */
+export function describeCommand(cmd, isMine) {
+  if (!cmd.ok) return null;
+  const o = cmd.order;
+  if (!o) return null;
+  const who = o.trader || o.owner || 'someone';
+  const mine = isMine(o.owner);
+  const p = v => `₹${px(v)}`;
+  if (cmd.command === 'cancel') return { who, mine, side: o.side, text: `cancelled a ${o.side} order (#${o.id}) at ${p(o.price)}` };
+  const fills = cmd.fills || [];
+  if (fills.length) {
+    const q = fills.reduce((a, f) => a + f.qty, 0);
+    const makers = [...new Set(fills.map(f => f.maker_trader))];
+    const verb = o.side === 'buy' ? 'bought' : 'sold';
+    const avg = fills.reduce((a, f) => a + f.price * f.qty, 0) / q;
+    return { who, mine, side: o.side, text: `${verb} <b>${q} TCX</b> at ${fills.length > 1 ? `avg ${p(avg)}` : p(fills[0].price)} from ${makers.slice(0, 2).join(', ')}${makers.length > 2 ? ` +${makers.length - 2}` : ''}` };
+  }
+  if (cmd.command === 'replace') return { who, mine, side: o.side, text: `moved an order to ${p(o.price)} (${o.qty} TCX)` };
+  return { who, mine, side: o.side, text: `posted a ${o.side} order: ${o.qty} TCX at ${p(o.price)}` };
+}
+
+export function feedItem(d, t, isNew = false) {
+  const initials = d.who.replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || '?';
+  return `<div class="it ${isNew ? 'new' : ''}"><span class="who-ico ${d.mine ? 'me' : ''}">${initials}</span>
+    <span><b class="${d.mine ? 'accent' : ''}">${d.mine ? 'You' : d.who}</b> ${d.text}</span><small>${clock(t)}</small></div>`;
+}

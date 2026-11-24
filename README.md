@@ -21,23 +21,41 @@ React dashboard  --HTTP-->  server.c (poll loop)  -->  api.c  -->  engine.c
 ```sh
 xcode-select --install      # once, if you don't have clang/make yet
 make                        # builds build/tradecore, build/test_engine, build/bench
-make test                   # 7,301 checks, including the proposal's worked example
+make test                   # 27,000+ checks: worked example, random streams, auth, bots
 make run                    # engine + dashboard on http://127.0.0.1:8080
-open http://127.0.0.1:8080  # the dashboard (any browser)
+open http://127.0.0.1:8080  # sign in with demo / demo1234, or create an account
 sh scripts/demo.sh          # (optional, second terminal) replays the worked example with curl
 ```
 
 Other targets:
 
 - `make asan` runs the tests under AddressSanitizer and UndefinedBehaviorSanitizer.
-- `make bench` runs the reproducible benchmark.
+- `make bench` runs the reproducible benchmark (no bots involved).
+- `./build/tradecore --no-sim` starts with an empty book and no bots.
 - Server flags: `./build/tradecore --port 8080 --host 127.0.0.1 --static ../frontend/dist`
 
 The full endpoint list is in [docs/API.md](docs/API.md). How the dashboard
 is organised is in [frontend/README.md](frontend/README.md).
 
-To demo the project: open **Scenarios**, load *Worked Example TCX* and press
-**Start Replay**, with the **DSA Visualizer** open in a second browser tab.
+### What you get
+
+- **Sign-in page.** Accounts are checked by the C engine: passwords are stored
+  as salted SHA-256 hashes and users are kept in a string-keyed hash table.
+- **A living market.** Twelve bot traders keep placing, cancelling and
+  replacing orders, and three hours of history are generated at start-up.
+- **Four sections** in the sidebar, each with tabs:
+
+| Section | Tabs |
+|---|---|
+| Dashboard | Overview · Order Book · Charts |
+| Trading Terminal | Terminal (with a paper portfolio) · My Orders · Trade History |
+| DSA Visualizer | Visualizer · Performance |
+| Demo Lab | Live Market (bot speed, market mood: calm / volatile / bull / bear / flash crash) · Scenarios |
+
+To demo the project: sign in, open **Demo Lab → Scenarios**, load *Worked
+Example TCX* and press **Start Replay**, with the **DSA Visualizer** open in a
+second browser tab. Then go to **Demo Lab → Live Market**, resume the bots and
+trigger a **Flash crash** while watching the charts.
 
 ## Reading order
 
@@ -53,8 +71,10 @@ Read the code bottom-up. Each file is short and depends only on the ones above i
 | 6 | `src/trace.c` | Ring buffer of trace events |
 | 7 | `src/engine.c` | `match_and_rest()` is the heart of the project; also cancel, replace, invariants and candles |
 | 8 | `src/reference.c` | Linear matcher used to verify the engine |
-| 9 | `src/api.c`, `src/json.c`, `src/server.c` | Plumbing: HTTP, JSON and SSE |
-| 10 | `frontend/js/pages/dsa.js` | How the visualizer replays the engine's trace events |
+| 9 | `src/sha256.c`, `src/auth.c` | Password hashing; a second hash table, keyed by strings, for users and sessions |
+| 10 | `src/sim.c` | Bot traders; self-trade prevention uses an iterative in-order AVL walk |
+| 11 | `src/api.c`, `src/json.c`, `src/server.c` | Plumbing: HTTP, JSON, SSE and sign-in checks |
+| 12 | `frontend/js/pages/dsa.js` | How the visualizer replays the engine's trace events |
 
 ## How the data structures work together
 
@@ -163,7 +183,7 @@ grows like O(log P) per command while the reference grows like O(N).
 | FastAPI bridge + Python ctypes | HTTP + SSE server written in C (`server.c`) | You asked for a backend in C only. A single thread gives the "one serialized engine worker" for free. |
 | React + TypeScript dashboard | Plain HTML/CSS/JavaScript modules (`frontend/`) | No Node.js or build step: the C server serves it directly, so `make run` is the whole setup. |
 | WebSockets | Server-Sent Events | Updates only flow server to client (commands go over HTTP POST). SSE is plain HTTP, easier to write correctly in C, and works with the browser's built-in `EventSource`. |
-| SQLite persistence + replay | In-memory only | You chose no persistence. Scenarios are seeded, so any demo can be reproduced. |
+| SQLite persistence + replay | In-memory only | You chose no persistence. Scenarios are seeded, so any demo can be reproduced. Accounts also reset on restart. |
 | Request-ID deduplication | Not implemented | It only matters for retries when persistence exists. |
 
 ## Owning this code

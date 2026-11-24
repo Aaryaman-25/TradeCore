@@ -11,15 +11,32 @@
 #define TRACE_CAPACITY   (1u << 18)    /* 262,144 events kept in the ring */
 #define SSE_TRACE_LIMIT  2000          /* max trace events pushed per command */
 
-int api_init(ApiState *s) {
+/* The signed-in user for the request being handled (NULL if anonymous). */
+static const User *g_user = NULL;
+static void broadcast_sim(ApiState *s, Buf *b);
+
+int api_init(ApiState *s, int with_sim) {
     memset(s, 0, sizeof *s);
     if (engine_init(&s->engine, TRACE_CAPACITY) != 0) return -1;
+    if (auth_init(&s->auth) != 0) return -1;
     s->stream_trace = 1;
     s->started_ms = tc_now_ms();
+    /* demo accounts so the login page works out of the box */
+    auth_register(&s->auth, "demo", "demo1234", 1, s->started_ms);
+    auth_register(&s->auth, "student", "student123", 1, s->started_ms);
+    sim_init(&s->sim, (uint64_t)s->started_ms);
+    if (with_sim) {
+        /* three hours of bot trading so the charts start full */
+        sim_seed_history(&s->sim, &s->engine, s->started_ms - 3 * 3600 * 1000LL, s->started_ms - 1000, 6000);
+        s->sim.running = 1;
+        s->sim.next_tick_ms = s->started_ms + 500;
+        s->engine.lat_count = s->engine.lat_pos = 0;   /* latency stats: live only */
+        s->engine.lat_total_ns = 0;
+    }
     return 0;
 }
 
-void api_free(ApiState *s) { engine_free(&s->engine); }
+void api_free(ApiState *s) { engine_free(&s->engine); auth_free(&s->auth); }
 
 /* ----------------------------------------------------------- helpers */
 
@@ -86,6 +103,8 @@ static void put_record(Buf *b, const OrderRecord *o) {
                (long long)((o->status == ST_OPEN || o->status == ST_PARTIAL) ? o->remaining : 0),
                (long long)(o->qty - o->remaining), status_name(o->status));
     buf_json_str(b, o->trader);
+    buf_puts(b, ",\"owner\":");
+    buf_json_str(b, o->owner);
     buf_printf(b, ",\"time_ms\":%lld,\"replaces\":%llu,\"replaced_by\":%llu}",
                (long long)o->time_ms, (unsigned long long)o->replaces,
                (unsigned long long)o->replaced_by);
@@ -109,6 +128,10 @@ static void put_trade(Buf *b, const Engine *e, const Trade *t) {
     buf_json_str(b, mk ? mk->trader : "");
     buf_puts(b, ",\"taker_trader\":");
     buf_json_str(b, tk ? tk->trader : "");
+    buf_puts(b, ",\"maker_owner\":");
+    buf_json_str(b, mk ? mk->owner : "");
+    buf_puts(b, ",\"taker_owner\":");
+    buf_json_str(b, tk ? tk->owner : "");
     buf_puts(b, "}");
 }
 
@@ -264,12 +287,37 @@ static void h_submit(ApiState *s, const char *body, size_t blen, ApiResponse *ou
     if (!json_get_i64(kv, n, "qty", &qty) && !json_get_i64(kv, n, "quantity", &qty)) {
         error_json(out, 400, reject_name(RJ_BAD_QTY), reject_message(RJ_BAD_QTY)); return;
     }
-    json_get_str(kv, n, "trader", trader, sizeof trader);
-    tc_result r = engine_submit(&s->engine, side, price, qty, trader, tc_now_ms());
+    /* Optional display label (e.g. "S1" in a scenario). It may not be
+     * another account's name or a bot's name, so nobody can pose as them. */
+    if (!json_get_str(kv, n, "label", trader, sizeof trader))
+        json_get_str(kv, n, "trader", trader, sizeof trader);
+    if (!trader[0] || !strcasecmp(trader, g_user->name)) {
+        strcpy(trader, g_user->name);
+    } else {
+        char key[TC_TRADER_LEN];
+        size_t i = 0;
+        for (; trader[i]; i++) key[i] = (char)(trader[i] >= 'A' && trader[i] <= 'Z' ? trader[i] + 32 : trader[i]);
+        key[i] = '\0';
+        if (strmap_get(&s->auth.users, key) || sim_is_bot_name(&s->sim, trader)) {
+            error_json(out, 403, "LABEL_NOT_ALLOWED", "that label belongs to another trader"); return;
+        }
+    }
+    tc_result r = engine_submit_as(&s->engine, side, price, qty, trader, g_user->name, tc_now_ms());
     finish_command(s, &r, out);
 }
 
+/* Only the account that placed an order may cancel or replace it. */
+static int check_owner(ApiState *s, tc_id id, ApiResponse *out) {
+    const OrderRecord *o = engine_record(&s->engine, id);
+    if (o && strcasecmp(o->owner, g_user->name) != 0) {
+        error_json(out, 403, "NOT_YOUR_ORDER", "you can only cancel or replace your own orders");
+        return 0;
+    }
+    return 1;
+}
+
 static void h_cancel(ApiState *s, tc_id id, ApiResponse *out) {
+    if (!check_owner(s, id, out)) return;
     tc_result r = engine_cancel(&s->engine, id, tc_now_ms());
     finish_command(s, &r, out);
 }
@@ -278,6 +326,7 @@ static void h_replace(ApiState *s, tc_id id, const char *body, size_t blen, ApiR
     JKV kv[16];
     int n = json_parse_flat(body, blen, kv, 16);
     if (n < 0) { error_json(out, 400, "BAD_JSON", "body must be a flat JSON object"); return; }
+    if (!check_owner(s, id, out)) return;
     const OrderRecord *old = engine_record(&s->engine, id);
     tc_price price;
     int64_t qty;
@@ -335,9 +384,10 @@ static int status_matches(const char *filter, tc_status st) {
 }
 
 static void h_orders(ApiState *s, const char *q, ApiResponse *out) {
-    char filter[16] = "all", trader[TC_TRADER_LEN] = "";
+    char filter[16] = "all", trader[TC_TRADER_LEN] = "", owner[TC_TRADER_LEN] = "";
     query_get(q, "status", filter, sizeof filter);
     query_get(q, "trader", trader, sizeof trader);
+    query_get(q, "owner", owner, sizeof owner);
     long limit = query_long(q, "limit", 100, 1, 5000);
     const Engine *e = &s->engine;
     Buf *b = &out->body;
@@ -349,6 +399,7 @@ static void h_orders(ApiState *s, const char *q, ApiResponse *out) {
         const OrderRecord *o = vec_at(&e->records, i);
         if (!status_matches(filter, o->status)) continue;
         if (trader[0] && strcmp(trader, o->trader)) continue;
+        if (owner[0] && strcasecmp(owner, o->owner)) continue;
         if (n++) buf_puts(b, ",");
         put_record(b, o);
     }
@@ -359,6 +410,8 @@ static void h_trades(ApiState *s, const char *q, ApiResponse *out) {
     long limit = query_long(q, "limit", 100, 1, 5000);
     long since = query_long(q, "since_id", 0, 0, 0x7fffffffffffffffL);
     long since_ms = query_long(q, "since_ms", 0, 0, 0x7fffffffffffffffL);
+    char owner[TC_TRADER_LEN] = "";
+    query_get(q, "owner", owner, sizeof owner);
     const Engine *e = &s->engine;
     Buf *b = &out->body;
     out->status = 200;
@@ -367,6 +420,10 @@ static void h_trades(ApiState *s, const char *q, ApiResponse *out) {
     for (size_t i = e->trades.len; i-- > 0 && n < limit;) {
         const Trade *t = engine_trade(e, i);
         if ((long)t->trade_id <= since || (long)t->time_ms < since_ms) break;
+        if (owner[0]) {      /* only trades where this account was maker or taker */
+            const OrderRecord *mk = engine_record(e, t->maker_id), *tk = engine_record(e, t->taker_id);
+            if (!(mk && !strcasecmp(mk->owner, owner)) && !(tk && !strcasecmp(tk->owner, owner))) continue;
+        }
         if (n++) buf_puts(b, ",");
         put_trade(b, e, t);
     }
@@ -666,9 +723,9 @@ static void h_trace(ApiState *s, const char *body, size_t blen, ApiResponse *out
 }
 
 static void broadcast_reset(ApiState *s, ApiResponse *out, const char *why) {
-    buf_printf(&out->broadcast, "event: reset\ndata: {\"reason\":\"%s\",\"cmd_seq\":%llu,\"event_seq\":%llu}\n\n",
+    buf_printf(&out->broadcast, "event: reset\ndata: {\"reason\":\"%s\",\"cmd_seq\":%llu,\"event_seq\":%llu,\"sim_running\":%s}\n\n",
                why, (unsigned long long)s->engine.cmd_seq,
-               (unsigned long long)s->engine.tracer.next_seq);
+               (unsigned long long)s->engine.tracer.next_seq, s->sim.running ? "true" : "false");
 }
 
 static void h_reset(ApiState *s, ApiResponse *out) {
@@ -690,6 +747,7 @@ static void h_scenario(ApiState *s, const char *body, size_t blen, ApiResponse *
     json_get_i64(kv, n, "count", &count);
     json_get_bool(kv, n, "reset", &do_reset);
     if (count > 1000000) count = 1000000;
+    s->sim.running = 0;                 /* scenarios run on a quiet market */
     if (do_reset) engine_reset(&s->engine);
     long ran = scenario_load(&s->engine, name, (uint64_t)seed, (long)count, tc_now_ms());
     if (ran < 0) {
@@ -705,6 +763,7 @@ static void h_scenario(ApiState *s, const char *body, size_t blen, ApiResponse *
     put_best(&out->body, &s->engine);
     buf_puts(&out->body, "}");
     broadcast_reset(s, out, "scenario");
+    broadcast_sim(s, &out->broadcast);
 }
 
 static void h_check(ApiState *s, ApiResponse *out) {
@@ -778,18 +837,14 @@ static void h_summary(ApiState *s, const char *q, ApiResponse *out) {
 
 /* Cancel every open order of one trader. Each cancel is its own command. */
 static void h_cancel_all(ApiState *s, const char *body, size_t blen, ApiResponse *out) {
-    JKV kv[8];
-    int n = json_parse_flat(body, blen, kv, 8);
-    char trader[TC_TRADER_LEN] = "";
-    if (n < 0 || !json_get_str(kv, n, "trader", trader, sizeof trader) || !trader[0]) {
-        error_json(out, 400, "BAD_JSON", "send {\"trader\":\"NAME\"}"); return;
-    }
+    (void)body; (void)blen;
+    const char *trader = g_user->name;     /* always the signed-in account */
     Engine *e = &s->engine;
     Vec ids;
     vec_init(&ids, sizeof(tc_id));
     for (size_t i = 0; i < e->records.len; i++) {
         const OrderRecord *o = vec_at(&e->records, i);
-        if ((o->status == ST_OPEN || o->status == ST_PARTIAL) && !strcmp(o->trader, trader)) {
+        if ((o->status == ST_OPEN || o->status == ST_PARTIAL) && !strcasecmp(o->owner, trader)) {
             tc_id *slot = vec_push(&ids);
             if (slot) *slot = o->id;
         }
@@ -805,6 +860,155 @@ static void h_cancel_all(ApiState *s, const char *body, size_t blen, ApiResponse
     }
     buf_puts(b, "]}");
     vec_free(&ids);
+}
+
+/* ------------------------------------------------------------- accounts */
+
+static void put_user(Buf *b, const User *u) {
+    buf_puts(b, "{\"username\":");
+    buf_json_str(b, u->name);
+    buf_printf(b, ",\"demo\":%s,\"created_ms\":%lld,\"last_login_ms\":%lld}",
+               u->is_demo ? "true" : "false", (long long)u->created_ms, (long long)u->last_login_ms);
+}
+
+static void auth_error(ApiResponse *out, auth_status st) {
+    int code = st == AUTH_WRONG_CREDENTIALS ? 401 : st == AUTH_TAKEN ? 409 : 400;
+    error_json(out, code, auth_code(st), auth_message(st));
+}
+
+static void h_login(ApiState *s, const char *body, size_t blen, ApiResponse *out, int registering) {
+    JKV kv[8];
+    int n = json_parse_flat(body, blen, kv, 8);
+    char user[64] = "", pw[96] = "";
+    if (n < 0 || !json_get_str(kv, n, "username", user, sizeof user) ||
+        !json_get_str(kv, n, "password", pw, sizeof pw)) {
+        error_json(out, 400, "BAD_JSON", "send {\"username\":\"...\",\"password\":\"...\"}"); return;
+    }
+    int64_t now = tc_now_ms();
+    if (registering) {
+        if (sim_is_bot_name(&s->sim, user)) { auth_error(out, AUTH_TAKEN); return; }
+        auth_status st = auth_register(&s->auth, user, pw, 0, now);
+        if (st != AUTH_OK) { auth_error(out, st); return; }
+    }
+    char token[AUTH_TOKEN_LEN + 1];
+    auth_status st = auth_login(&s->auth, user, pw, now, token);
+    if (st != AUTH_OK) { auth_error(out, st); return; }
+    const User *u = auth_check(&s->auth, token, now);
+    out->status = 200;
+    buf_puts(&out->body, "{\"ok\":true,\"token\":");
+    buf_json_str(&out->body, token);
+    buf_puts(&out->body, ",\"user\":");
+    put_user(&out->body, u);
+    buf_puts(&out->body, "}");
+}
+
+static void h_me(ApiResponse *out) {
+    out->status = 200;
+    buf_puts(&out->body, "{\"ok\":true,\"user\":");
+    put_user(&out->body, g_user);
+    buf_puts(&out->body, "}");
+}
+
+static void h_logout(ApiState *s, const char *token, ApiResponse *out) {
+    auth_logout(&s->auth, token);
+    out->status = 200;
+    buf_puts(&out->body, "{\"ok\":true}");
+}
+
+/* ------------------------------------------------------------ simulator */
+
+static void put_sim(Buf *b, const Sim *m) {
+    buf_printf(b, "{\"running\":%s,\"rate\":%.2f,\"mode\":\"%s\",\"blurb\":",
+               m->running ? "true" : "false", m->rate, sim_mode_name(m->mode));
+    buf_json_str(b, sim_mode_blurb(m->mode));
+    buf_printf(b, ",\"fair_price\":%.2f,\"steps\":%llu,\"modes\":[", m->mid / 100.0, (unsigned long long)m->steps);
+    for (int i = 0; i < SIM__MODES; i++) {
+        buf_printf(b, "%s{\"name\":\"%s\",\"blurb\":", i ? "," : "", sim_mode_name((sim_mode)i));
+        buf_json_str(b, sim_mode_blurb((sim_mode)i));
+        buf_puts(b, "}");
+    }
+    buf_puts(b, "],\"bots\":[");
+    for (int i = 0; i < m->nbots; i++) {
+        const SimBot *t = &m->bots[i];
+        buf_printf(b, "%s{\"name\":\"%s\",\"kind\":\"%s\",\"orders\":%llu,\"cancels\":%llu,\"fills\":%llu,\"volume\":%lld}",
+                   i ? "," : "", t->name, t->kind, (unsigned long long)t->orders,
+                   (unsigned long long)t->cancels, (unsigned long long)t->fills, (long long)t->volume);
+    }
+    buf_puts(b, "]}");
+}
+
+static void broadcast_sim(ApiState *s, Buf *b) {
+    buf_puts(b, "event: sim\ndata: ");
+    put_sim(b, &s->sim);
+    buf_puts(b, "\n\n");
+}
+
+static void h_sim_get(ApiState *s, ApiResponse *out) {
+    out->status = 200;
+    buf_puts(&out->body, "{\"ok\":true,\"sim\":");
+    put_sim(&out->body, &s->sim);
+    buf_puts(&out->body, "}");
+}
+
+static void h_sim_set(ApiState *s, const char *body, size_t blen, ApiResponse *out) {
+    JKV kv[8];
+    int n = json_parse_flat(body, blen, kv, 8);
+    if (n < 0) { error_json(out, 400, "BAD_JSON", "body must be a flat JSON object"); return; }
+    int64_t now = tc_now_ms();
+    int run;
+    int64_t rate;
+    char mode[16];
+    if (json_get_bool(kv, n, "running", &run)) {
+        if (run && !s->sim.running) s->sim.next_tick_ms = now;
+        s->sim.running = run;
+    }
+    if (json_get_i64(kv, n, "rate", &rate)) {
+        if (rate < 1) rate = 1;
+        if (rate > 50) rate = 50;
+        s->sim.rate = (double)rate;
+    }
+    if (json_get_str(kv, n, "mode", mode, sizeof mode)) {
+        sim_mode m;
+        if (!sim_parse_mode(mode, &m)) { error_json(out, 400, "UNKNOWN_MODE", "mode must be calm, volatile, bull, bear or crash"); return; }
+        sim_set_mode(&s->sim, m, now);
+    }
+    int reseed = 0;
+    if (json_get_bool(kv, n, "reseed", &reseed) && reseed) {
+        /* fresh market: wipe the book and generate 3 hours of history again */
+        engine_reset(&s->engine);
+        Sim fresh;
+        sim_init(&fresh, (uint64_t)now);
+        fresh.rate = s->sim.rate;
+        s->sim = fresh;
+        sim_seed_history(&s->sim, &s->engine, now - 3 * 3600 * 1000LL, now - 1000, 6000);
+        s->sim.running = 1;
+        s->sim.next_tick_ms = now + 300;
+        broadcast_reset(s, out, "reseed");
+    }
+    h_sim_get(s, out);
+    broadcast_sim(s, &out->broadcast);
+}
+
+int64_t api_sim_tick(ApiState *s, int64_t now_ms, Buf *broadcast) {
+    Sim *m = &s->sim;
+    if (!m->running) return 1000;
+    tc_result res[SIM_MAX_BATCH];
+    int guard = 0;
+    while (now_ms >= m->next_tick_ms && guard++ < 20) {
+        int k = sim_step(m, &s->engine, now_ms, res);
+        for (int i = 0; i < k; i++) {
+            ApiResponse tmp;
+            tmp.broadcast = *broadcast;
+            broadcast_command(s, &res[i], &tmp);
+            *broadcast = tmp.broadcast;
+        }
+        /* jittered interval around 1/rate seconds */
+        double base = 1000.0 / (m->rate > 0 ? m->rate : 1);
+        m->next_tick_ms += (int64_t)(base * (0.4 + 1.2 * (double)(rng_next(&m->rng) % 1000) / 1000.0)) + 1;
+    }
+    if (now_ms - m->next_tick_ms > 2000) m->next_tick_ms = now_ms;   /* don't try to catch up after a stall */
+    int64_t wait = m->next_tick_ms - now_ms;
+    return wait < 0 ? 0 : wait;
 }
 
 /* ------------------------------------------------------------ router */
@@ -826,14 +1030,30 @@ static int match_order_path(const char *path, tc_id *id, const char **action) {
 
 void api_handle(ApiState *s, const char *method, const char *path,
                 const char *query, const char *body, size_t body_len,
-                ApiResponse *out) {
+                const char *token, ApiResponse *out) {
     int get = !strcmp(method, "GET"), post = !strcmp(method, "POST");
     int del = !strcmp(method, "DELETE");
     tc_id id;
     const char *action;
     if (!body) { body = ""; body_len = 0; }
+    g_user = auth_check(&s->auth, token, tc_now_ms());
 
-    if (get && !strcmp(path, "/api/health"))            h_health(s, out);
+    /* public endpoints: sign-in and read-only market data */
+    if (post && !strcmp(path, "/api/auth/login"))         { h_login(s, body, body_len, out, 0); return; }
+    if (post && !strcmp(path, "/api/auth/register"))      { h_login(s, body, body_len, out, 1); return; }
+    if (post && !strcmp(path, "/api/auth/logout"))        { h_logout(s, token, out); return; }
+
+    /* everything that changes state needs a signed-in user */
+    if (!get && !g_user) {
+        error_json(out, 401, "NOT_LOGGED_IN", "Please sign in first.");
+        return;
+    }
+
+    if (get && !strcmp(path, "/api/auth/me")) {
+        if (!g_user) error_json(out, 401, "NOT_LOGGED_IN", "Please sign in first.");
+        else h_me(out);
+    }
+    else if (get && !strcmp(path, "/api/health"))       h_health(s, out);
     else if (get && !strcmp(path, "/api/book"))          h_book(s, query, out);
     else if (get && !strcmp(path, "/api/book/level"))    h_level(s, query, out);
     else if (get && !strcmp(path, "/api/orders"))        h_orders(s, query, out);
@@ -854,6 +1074,8 @@ void api_handle(ApiState *s, const char *method, const char *path,
     else if (get && !strcmp(path, "/api/events"))        h_events(s, query, out);
     else if (get && !strcmp(path, "/api/stats"))         h_stats(s, out);
     else if (get && !strcmp(path, "/api/check"))         h_check(s, out);
+    else if (get && !strcmp(path, "/api/sim"))           h_sim_get(s, out);
+    else if (post && !strcmp(path, "/api/sim"))          h_sim_set(s, body, body_len, out);
     else if (post && !strcmp(path, "/api/trace"))        h_trace(s, body, body_len, out);
     else if (post && !strcmp(path, "/api/reset"))        h_reset(s, out);
     else if (post && !strcmp(path, "/api/scenario"))     h_scenario(s, body, body_len, out);

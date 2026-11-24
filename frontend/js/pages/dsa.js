@@ -6,7 +6,7 @@
 // are queued; playback highlights the nodes/buckets each event touches on the
 // snapshot taken BEFORE that command. When a command's events have all been
 // played, a fresh snapshot is fetched so the new shape appears.
-import { get, post } from '../api.js';
+import { get, post, isMine } from '../api.js';
 import { settings, bus } from '../store.js';
 import { $, $$, esc, px, int, toast, onResize } from '../ui.js';
 import { icon } from '../icons.js';
@@ -20,6 +20,7 @@ const S = {
   selOrder: null, selBucket: null,
   queue: [], playing: true, speed: 1, cur: null, log: [],
   pendingSnapshot: false, newNodes: new Set(), trace: null,
+  animate: 'mine', owners: new Map(), lastSnap: 0, snapTimer: null, skipped: 0,
 };
 let playTimer = null, offs = [], stopResize;
 
@@ -77,17 +78,20 @@ export default {
 
     <div class="grid" style="align-content:start">
       <div class="card">
-        <div class="card-head" style="margin-bottom:12px"><h3>Drive the Engine</h3><a href="#/scenarios" style="font-size:13px">Scenarios →</a></div>
+        <div class="card-head" style="margin-bottom:12px"><h3>Drive the Engine</h3><a href="#/lab/scenarios" style="font-size:13px">Step-by-step scenarios →</a></div>
         <div style="display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:center">
           <div class="seg sm" id="dv-oside"><button class="on" data-v="buy">BUY</button><button data-v="sell">SELL</button></div>
           <div class="input" style="height:38px"><input id="dv-price" placeholder="Price ₹" style="font-size:15px"></div>
           <div class="input" style="height:38px"><input id="dv-qty" placeholder="Qty" style="font-size:15px"></div>
           <button class="btn primary" id="dv-send">Send</button>
         </div>
-        <div class="dim" style="font-size:12.5px;margin-top:10px">Orders are placed as <b id="dv-trader"></b>. Tip: buy above the best ask to watch fills, dequeues and node removals.</div>
+        <div class="dim" style="font-size:12.5px;margin-top:10px">Orders are placed as <b id="dv-trader"></b>. Tip: buy at or above the best ask to watch fills, dequeues and node removals.</div>
       </div>
       <div class="card">
         <div class="card-head" style="margin-bottom:12px"><h3>Trace Playback</h3><span class="tag" id="dv-queued">0 queued</span></div>
+        <div class="stat-row" style="margin-bottom:12px;font-size:13.5px"><span>Animate</span>
+          <div class="seg sm" id="dv-anim"><button class="on" data-v="mine">My orders</button><button data-v="all">All activity (incl. bots)</button></div></div>
+        <div class="dim" style="font-size:12.5px;margin:-4px 0 12px" id="dv-skipped"></div>
         <div class="title-row" style="gap:8px">
           <button class="btn sm primary" id="dv-play">${icon('pause', 15)} Pause</button>
           <button class="btn sm ghost" id="dv-step">${icon('step-forward', 15)} Step</button>
@@ -131,6 +135,8 @@ export default {
     wireSeg(root, '#dv-side', v => { S.side = v; drawTree(); drawKpis(); });
     wireSeg(root, '#dv-speed', v => { S.speed = +v; });
     wireSeg(root, '#dv-oside', () => {});
+    $$('#dv-anim button').forEach(b => b.classList.toggle('on', b.dataset.v === S.animate));
+    wireSeg(root, '#dv-anim', v => { S.animate = v; S.skipped = 0; drawSkipped(); });
     $('#dv-depth').onchange = async e => { S.depth = +e.target.value; await snapshot(); };
     $('#dv-play').onclick = () => { S.playing = !S.playing; drawPlay(); if (S.playing) pump(); else if (typeof playTimer === 'number') { clearTimeout(playTimer); playTimer = null; } };
     $('#dv-step').onclick = () => { S.playing = false; drawPlay(); clearTimeout(playTimer); playTimer = null; stepOnce(); };
@@ -154,22 +160,38 @@ export default {
     $('#dv-hprev').onclick = () => { if (S.hashPage > 0) { S.hashPage--; drawHash(); } };
     $('#dv-hnext').onclick = () => { if (S.hash && (S.hashPage + 1) * 1024 < S.hash.capacity) { S.hashPage++; drawHash(); } };
     offs = [
-      bus.on('trace', m => { S.queue.push(...m.events); drawQueue(); if (S.playing) pump(); }),
+      bus.on('command', c => {
+        S.owners.set(c.cmd_seq, c.order?.owner ?? c.replaced?.owner ?? '');
+        if (S.owners.size > 600) S.owners.delete(S.owners.keys().next().value);
+      }),
+      bus.on('trace', m => {
+        if (S.animate === 'mine' && !isMine(S.owners.get(m.cmd_seq))) { S.skipped++; drawSkipped(); return; }
+        S.queue.push(...m.events);
+        // a very busy market: drop old commands and jump to the latest
+        if (S.queue.length > 1500) S.queue = S.queue.filter(e => e.cmd_seq === m.cmd_seq);
+        drawQueue(); if (S.playing) pump();
+      }),
       bus.on('reset', () => { S.queue = []; S.selLevel = null; S.level = null; S.selOrder = null; S.log = []; drawLog(); }),
     ];
     stopResize = onResize($('#dv-tree'), drawTree);
     drawPlay();
+    drawSkipped();
     const ev = await get('/api/events?limit=1');
     S.trace = ev;
     drawTraceTag();
   },
 
-  unmount() { offs.forEach(f => f()); stopResize?.(); if (typeof playTimer === 'number') clearTimeout(playTimer); playTimer = null; S.queue = []; S.cur = null; },
+  unmount() { offs.forEach(f => f()); stopResize?.(); if (typeof playTimer === 'number') clearTimeout(playTimer); clearTimeout(S.snapTimer); S.snapTimer = null; playTimer = null; S.queue = []; S.cur = null; },
 
   async refresh(reason) {
     // While events are queued, keep the "before" snapshot; refresh once drained.
     if (S.queue.length || S.cur) { S.pendingSnapshot = true; return; }
-    if (reason === 'command') { S.pendingSnapshot = false; }
+    // bots change the book constantly: redraw at most every 1.5 s
+    const wait = 1500 - (Date.now() - S.lastSnap);
+    if (reason !== 'mount' && wait > 0) {
+      if (!S.snapTimer) S.snapTimer = setTimeout(() => { S.snapTimer = null; if (!S.queue.length && !S.cur) snapshot(); }, wait);
+      return;
+    }
     await snapshot();
   },
 };
@@ -179,7 +201,15 @@ function kpi(label, id, ic, bar, cls) {
     <div class="value num" style="font-size:24px;margin:8px 0 12px" id="${id}">—</div><div class="bar ${cls === 'accent' ? '' : cls}"><i id="${bar}" style="width:0"></i></div></div>`;
 }
 
+function drawSkipped() {
+  const el = $('#dv-skipped');
+  if (el) el.textContent = S.animate === 'mine'
+    ? `Animating only your orders · ${S.skipped} bot command${S.skipped === 1 ? '' : 's'} applied without animation`
+    : 'Animating every command, including the bots — slow the bots down in Demo Lab → Live Market to follow along.';
+}
+
 async function snapshot() {
+  S.lastSnap = Date.now();
   const md = S.depth;
   const [tb, ta] = await Promise.all([get(`/api/dsa/tree?side=buy&max_depth=${md}`), get(`/api/dsa/tree?side=sell&max_depth=${md}`)]);
   S.trees.buy = tb; S.trees.sell = ta;

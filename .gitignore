@@ -1,3 +1,9 @@
+# build output
 build/
 *.o
+*.dSYM/
+# editor / OS files
 .DS_Store
+.vscode/
+.idea/
+*.swp

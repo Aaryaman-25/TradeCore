@@ -1,6 +1,6 @@
 // Settings: every control here changes real behaviour of the dashboard.
 import { get, post, roundTrips, connectStream } from '../api.js';
-import { settings } from '../store.js';
+import { settings, session } from '../store.js';
 import { $, $$, esc, toast, modal } from '../ui.js';
 import { icon } from '../icons.js';
 
@@ -8,7 +8,7 @@ let draft = null, trace = null, timer;
 
 const SECTIONS = [
   ['general', 'General & Display', 'sliders-horizontal'],
-  ['trading', 'Trading Terminal', 'chart-candlestick'],
+  ['trading', 'Account & Trading', 'chart-candlestick'],
   ['charts', 'Charts & Visuals', 'trending-up'],
   ['stream', 'Live Stream & Alerts', 'bell'],
   ['engine', 'Engine & API', 'shield-check'],
@@ -87,9 +87,9 @@ function render() {
   </div>
 
   <div class="card" id="sec-trading">
-    <h3>Trading Terminal Preferences</h3><div class="sub" style="margin-bottom:10px">Order entry defaults and confirmation settings.</div>
-    ${row('Trader ID', 'Label attached to orders placed from this browser. "My Orders" and YOURS markers use it.',
-      `<div class="input" style="height:38px;width:170px"><input data-k="trader" maxlength="15" value="${esc(d.trader)}" style="font-size:15px"></div>`)}
+    <h3>Account &amp; Trading Preferences</h3><div class="sub" style="margin-bottom:10px">Who you are signed in as, and order entry defaults.</div>
+    ${row('Account', `Signed in as <b>${esc(session.user?.username || '')}</b>${session.user?.demo ? ' (shared demo account)' : ''}. Your orders and trades are labelled with this name.`,
+      `<button class="btn sm danger-ghost" id="st-signout">${icon('log-out', 14)} Sign out</button>`)}
     ${row('One-Click Trading', 'Place orders instantly without a confirmation dialog.', toggle('oneClick', d.oneClick))}
     ${row('Default Order Type', 'Pre-selected order type in the order entry panel.',
       `<select class="select"><option selected>Limit Order</option><option disabled>Market (out of scope)</option><option disabled>Stop-Limit (out of scope)</option></select>`)}
@@ -120,7 +120,7 @@ function render() {
     ${row('Engine URL', 'Leave empty when the engine serves this page (./build/tradecore --static frontend).',
       `<div class="input" style="height:38px;width:260px"><input data-k="apiBase" placeholder="same origin" value="${esc(d.apiBase)}" style="font-size:15px"></div>`)}
     <div id="st-engine"></div>
-    ${row('Reset Engine Session', 'Clears the order book, orders and trades in the running engine.', '<button class="btn danger sm" id="st-wipe">Reset Session</button>')}
+    ${row('Reset Engine Session', 'Clears the order book, orders and trades in the running engine (the bots keep trading).', '<button class="btn danger sm" id="st-wipe">Reset Session</button>')}
   </div>`;
 
   $('#st-body').onchange = e => {
@@ -131,7 +131,8 @@ function render() {
     if (k === 'chartSmooth') v = v === 'true';
     draft[k] = v;
   };
-  $('#st-body').oninput = e => { const k = e.target.dataset.k; if (k === 'trader' || k === 'apiBase') draft[k] = e.target.value.trim(); };
+  $('#st-body').oninput = e => { const k = e.target.dataset.k; if (k === 'apiBase') draft[k] = e.target.value.trim(); };
+  $('#st-signout').onclick = async () => { await post('/api/auth/logout').catch(() => {}); session.clear(); location.hash = ''; location.reload(); };
   $$('[data-theme-pick]').forEach(el => el.onclick = () => { draft.theme = el.dataset.themePick; render(); renderEngine(); });
   $$('[data-seg] button').forEach(b => b.onclick = () => {
     draft[b.parentElement.dataset.seg] = +b.dataset.v;
@@ -159,7 +160,6 @@ function renderEngine() {
 
 function save() {
   const baseChanged = draft.apiBase !== settings.get('apiBase');
-  if (!draft.trader) draft.trader = 'ME';
   settings.set(draft);
   if (baseChanged) connectStream();
   toast('Settings saved', 'ok');

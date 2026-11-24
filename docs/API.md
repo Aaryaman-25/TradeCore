@@ -3,6 +3,32 @@
 Base URL: `http://127.0.0.1:8080`. Everything is JSON. CORS is open (`*`), so a
 React dev server on another port (e.g. Vite on 5173) can call it directly.
 
+## Signing in
+
+Reading market data (`GET`) is public. **Every command that changes something
+(`POST`/`DELETE`) needs a signed-in account.** Send the session token in a
+header:
+
+```
+Authorization: Bearer <token>
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/auth/register` `{"username","password"}` | Create an account (username 3–15 chars `A-Z a-z 0-9 _ - .`; password 6–64 chars) and sign in. Returns `{token, user}`. `409 USERNAME_TAKEN` (bot names are reserved). |
+| `POST /api/auth/login` `{"username","password"}` | Returns `{token, user}`; `401 WRONG_CREDENTIALS` otherwise. Usernames are case-insensitive. |
+| `GET /api/auth/me` | The account behind the token, or `401 NOT_LOGGED_IN`. |
+| `POST /api/auth/logout` | Ends the session. |
+
+Demo accounts created at start-up: `demo` / `demo1234` and `student` / `student123`.
+Passwords are stored as salted SHA-256 hashes (20,000 rounds); tokens are 256-bit
+random values that expire after 12 hours. Accounts live in memory and reset
+when the engine restarts.
+
+**Ownership.** Every order records its `owner` (the account that placed it)
+and a display `trader` label. You can only cancel or replace orders whose
+owner is you (`403 NOT_YOUR_ORDER`).
+
 **Conventions**
 
 - **Prices** are rupees with at most 2 decimals and must be a multiple of the
@@ -45,7 +71,9 @@ React dev server on another port (e.g. Vite on 5173) can call it directly.
 {"side":"buy","price":101.00,"qty":200,"trader":"B1"}
 ```
 
-`trader` is optional: a label of up to 15 characters, shown in the UI.
+`label` is optional: a display name of up to 15 characters (for example `"S1"`
+in a scenario). It defaults to your username and may not be another account's
+or a bot's name (`403 LABEL_NOT_ALLOWED`). The order's `owner` is always you.
 
 The response is a **command result**. The `/api/stream` command event uses the same shape.
 
@@ -71,13 +99,9 @@ sequences this command produced. Use it with `/api/events`.
 
 ### `POST /api/orders/{id}/cancel` (or `DELETE /api/orders/{id}`) cancels the remainder of an active order
 
-### `POST /api/orders/cancel-all` cancels every open order of one trader
+### `POST /api/orders/cancel-all` cancels every open order you own
 
-```json
-{"trader": "ME"}
-```
-
-Each cancel is its own engine command, broadcast over the stream. Returns `{"ok":true,"cancelled":3,"ids":[4,7,9]}`.
+No body needed. Each cancel is its own engine command, broadcast over the stream. Returns `{"ok":true,"cancelled":3,"ids":[4,7,9]}`.
 
 ### `POST /api/orders/{id}/replace` cancels and replaces an order
 
@@ -99,9 +123,9 @@ and `replaced_by` set).
 |---|---|
 | `GET /api/book?depth=20` | `best_bid`, `best_ask`, `spread`, `mid`, `last_price`, `bids[]` (highest first) and `asks[]` (lowest first). Each level is `{price, qty, orders, node_id}`. |
 | `GET /api/book/level?side=buy&price=101.00` | The FIFO queue at one price: `orders[]` in time order, each with `id`, `seq`, `remaining`, `qty` (original), `time_ms`, `prev`, `next`, `hash_bucket` and `trader`. Also `head`, `tail`, `total_qty` and `count`. |
-| `GET /api/orders?status=open&trader=B1&limit=100` | Order history, newest first. `status` can be `all`, `open` (open plus partial), `closed`, or any single status. |
+| `GET /api/orders?status=open&owner=demo&trader=B1&limit=100` | Order history, newest first. `status` can be `all`, `open` (open plus partial), `closed`, or any single status. `owner` filters by account, `trader` by label. |
 | `GET /api/orders/{id}` | One order, its fills, and `book` = `{node_id, queue_position, level_count, hash_bucket}` while it is active (`null` otherwise). |
-| `GET /api/trades?limit=100&since_id=0&since_ms=0` | Fills, newest first. `since_ms` keeps only fills at or after that time. |
+| `GET /api/trades?limit=100&since_id=0&since_ms=0&owner=demo` | Fills, newest first, with `maker_trader`/`taker_trader` labels and `maker_owner`/`taker_owner` accounts. `since_ms` keeps only fills at or after that time; `owner` keeps only fills where that account was maker or taker. |
 | `GET /api/summary?since_ms=0` | Session summary: `open`, `high`, `low`, `last`, `vwap`, `volume`, `turnover`, `trades`, `buy_volume` / `sell_volume` (by aggressor), best bid/ask with quantities, and total `bid_depth` / `ask_depth`. |
 | `GET /api/candles?interval_ms=60000&limit=300` | OHLCV bars built from fills. Intervals with no trades are **omitted**, so the UI should mark gaps. |
 
@@ -149,6 +173,7 @@ es.addEventListener("command", e => { const r = JSON.parse(e.data); /* same shap
 es.addEventListener("trace",   e => { const { cmd_seq, events, truncated } = JSON.parse(e.data); });
 es.addEventListener("reset",   e => { /* scenario loaded or session reset: refetch everything */ });
 es.addEventListener("hello",   e => { const { cmd_seq, event_seq } = JSON.parse(e.data); });
+es.addEventListener("sim",     e => { /* simulator settings changed: same shape as GET /api/sim */ });
 ```
 
 - `command` events carry `id: <cmd_seq>`. If a `cmd_seq` is skipped, refetch
@@ -158,6 +183,23 @@ es.addEventListener("hello",   e => { const { cmd_seq, event_seq } = JSON.parse(
 - Comment lines (`: ping`) arrive every 15 s to keep the connection alive.
 
 ---
+
+## Live market simulator (bots)
+
+Twelve bot traders (2 market makers, 8 retail traders, a momentum trader and an
+institution) send ordinary engine commands so the market is always moving. At
+start-up the engine generates three hours of bot history so charts are full.
+Bots never trade with themselves: before sending an order they cancel their own
+resting orders it would cross (self-trade prevention). Start the engine with
+`--no-sim` to turn all of this off.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/sim` | `running`, `rate` (bot commands/s), `mode`, hidden `fair_price`, `steps`, every mode with its description, and per-bot `orders` / `cancels` / `fills` / `volume`. |
+| `POST /api/sim` `{"running":true,"rate":5,"mode":"bull","reseed":false}` | Any subset. `mode` is `calm`, `volatile`, `bull`, `bear` or `crash` (crash returns to calm after ~2 minutes). `rate` is 1–50. `reseed:true` clears everything and generates fresh history. |
+
+Loading a scenario with `POST /api/scenario` pauses the bots. The stream sends
+an `event: sim` message whenever the simulator settings change.
 
 ## Session, performance and debugging
 

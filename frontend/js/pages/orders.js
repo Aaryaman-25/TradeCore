@@ -53,7 +53,7 @@ export default {
   async refresh() {
     const trader = settings.get('trader');
     const [r, st] = await Promise.all([
-      get(`/api/orders?status=all&limit=5000${scope === 'mine' ? `&trader=${encodeURIComponent(trader)}` : ''}`),
+      get(`/api/orders?status=all&limit=5000${scope === 'mine' ? `&owner=${encodeURIComponent(trader)}` : ''}`),
       get('/api/stats'),
     ]);
     orders = r.orders || [];
@@ -98,7 +98,7 @@ function draw() {
       <td class="r num ${live ? 'accent' : ''}">${int(live ? o.remaining : (o.status === 'filled' ? 0 : unfilled))}</td>
       <td style="padding-left:24px">${statusTag(o.status)}${o.replaced_by ? `<div class="dim" style="font-size:12px;margin-top:4px">→ #${o.replaced_by}</div>` : ''}</td>
       <td class="num">${clock(o.time_ms)} IST</td></tr>`;
-  }).join('') : `<tr><td colspan="9" class="empty">No orders match. ${scope === 'mine' ? `Orders placed as <b>${esc(settings.get('trader'))}</b> appear here; switch “Trader” to All to see scenario orders.` : ''}</td></tr>`;
+  }).join('') : `<tr><td colspan="9" class="empty">No orders match. ${scope === 'mine' ? `Orders placed as <b>${esc(settings.get('trader'))}</b> appear here; switch “Trader” to All to see the bots' orders.` : ''}</td></tr>`;
   const from = rows.length ? (page - 1) * PER_PAGE + 1 : 0;
   $('#mo-showing').innerHTML = `Showing <b>${from}-${Math.min(page * PER_PAGE, rows.length)}</b> of <b>${rows.length}</b> orders`;
   const nums = [];
@@ -124,10 +124,10 @@ function exportCsv() {
 
 async function cancelAll() {
   const trader = settings.get('trader');
-  const n = orders.filter(o => (o.status === 'open' || o.status === 'partial') && o.trader === trader).length;
+  const n = orders.filter(o => (o.status === 'open' || o.status === 'partial') && o.owner.toLowerCase() === trader.toLowerCase()).length;
   if (!n) return toast(`No open orders for ${esc(trader)}`);
   const ok = await modal({ title: 'Cancel all open orders?', body: `This cancels <b>${n}</b> open order(s) placed as <b>${esc(trader)}</b>. Each cancel is a separate engine command.`, okText: 'Cancel All', danger: true });
   if (!ok) return;
-  const r = await post('/api/orders/cancel-all', { trader });
+  const r = await post('/api/orders/cancel-all');
   toast(r.ok ? `Cancelled ${r.cancelled} order(s)` : esc(r.message), r.ok ? 'ok' : 'err');
 }
